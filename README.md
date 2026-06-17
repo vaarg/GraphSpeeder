@@ -25,6 +25,13 @@ Identity and access auditing module. Given a token, enumerates the target user's
 
 > Full documentation: [wiki/AccessCheck](https://github.com/vaarg/GraphSpeeder/wiki/AccessCheck)
 
+### [Invoke-MailboxAudit.ps1](Invoke-MailboxAudit.ps1)
+*GraphRunner supplement*
+
+Two-function mailbox audit. Probes user mailboxes and Microsoft 365 group inboxes for read access, producing a unified accessible-mailboxes CSV. Then reads or searches messages from those that are accessible. Designed to chain with `Resume-GroupAudit.ps1` output for group inbox discovery. Replaces `Invoke-GraphOpenInboxFinder`, which sets the HTTP status code in a variable that is never subsequently referenced, making every 401, 403, 404, and 429 response completely silent.
+
+> Full documentation: [wiki/MailboxAudit](https://github.com/vaarg/GraphSpeeder/wiki/MailboxAudit)
+
 ---
 
 ## Requirements
@@ -36,6 +43,7 @@ Requirements vary by script:
 | `Resume-GroupAudit.ps1` | Yes | Calls `Invoke-RefreshGraphTokens` |
 | `Resume-SharePointAudit.ps1` | Yes | Calls `Invoke-RefreshGraphTokens`, `Invoke-ForgeUserAgent`, `Invoke-DriveFileDownload` |
 | `Invoke-AccessCheck.ps1` | Optional | Uses `Invoke-RefreshGraphTokens` for token refresh resilience only; runs without it if the token does not expire |
+| `Invoke-MailboxAudit.ps1` | Yes | Calls `Invoke-RefreshGraphTokens` |
 
 All scripts require:
 - Windows PowerShell 5.1 or PowerShell 7+
@@ -44,13 +52,14 @@ All scripts require:
 ## Setup
 
 ```powershell
-# Load GraphRunner first if using the Resume- scripts or want token refresh in Invoke-AccessCheck
+# Load GraphRunner first if using the supplement scripts or want token refresh in Invoke-AccessCheck
 . .\GraphRunner\GraphRunner.ps1
 
 # Load whichever scripts you need
 . .\Resume-GroupAudit.ps1
 . .\Resume-SharePointAudit.ps1
 . .\Invoke-AccessCheck.ps1
+. .\Invoke-MailboxAudit.ps1
 ```
 
 ## Credits
