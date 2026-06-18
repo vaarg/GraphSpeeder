@@ -28,7 +28,7 @@ Identity and access auditing module. Given a token, enumerates the target user's
 ### [Invoke-MailboxAudit.ps1](Invoke-MailboxAudit.ps1)
 *GraphRunner supplement*
 
-Two-function mailbox audit. Probes user mailboxes and Microsoft 365 group inboxes for read access, producing a unified accessible-mailboxes CSV. Then reads or searches messages from those that are accessible. Designed to chain with `Resume-GroupAudit.ps1` output for group inbox discovery. Replaces `Invoke-GraphOpenInboxFinder`, which sets the HTTP status code in a variable that is never subsequently referenced, making every 401, 403, 404, and 429 response completely silent.
+Three-function mailbox audit. Probes user mailboxes and Microsoft 365 group inboxes for read access, producing a unified accessible-mailboxes CSV. Reads or searches messages from those that are accessible, with optional full body and attachment download. Searches previously saved bodies offline with zero API calls for opsec-safe repeated keyword searches. Designed to chain with `Resume-GroupAudit.ps1` output for group inbox discovery. Replaces `Invoke-GraphOpenInboxFinder`, which sets the HTTP status code in a variable that is never subsequently referenced, making every 401, 403, 404, and 429 response completely silent.
 
 > Full documentation: [wiki/MailboxAudit](https://github.com/vaarg/GraphSpeeder/wiki/MailboxAudit)
 
