@@ -621,12 +621,13 @@ function Get-MbxMatchInfo {
         $fieldMatched = $false
         foreach ($t in $Terms) {
             if (-not $t) { continue }
-            $idx = $val.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase)
-            if ($idx -ge 0) {
+            $rxMatch = [regex]::Match($val, "\b" + [regex]::Escape($t) + "\b", 'IgnoreCase')
+            if ($rxMatch.Success) {
                 $fieldMatched = $true
-                $actual = $val.Substring($idx, $t.Length)
+                $actual = $rxMatch.Value
                 if (-not $matchedTerms.Contains($actual)) { [void]$matchedTerms.Add($actual) }
                 if (-not $context) {
+                    $idx     = $rxMatch.Index
                     $start   = [Math]::Max(0, $idx - $Window)
                     $end     = [Math]::Min($val.Length, $idx + $t.Length + $Window)
                     $snippet = ($val.Substring($start, $end - $start) -replace '\s+', ' ').Trim()
