@@ -1400,7 +1400,11 @@ function Search-MailboxCache {
     # Output
     # -----------------------------------------------------------------------
     if ($OutFile -and $hits.Count -gt 0) {
-        $hits | Export-Csv -Path $OutFile -NoTypeInformation
+        if (Test-Path $OutFile) {
+            $hits | Export-Csv -Path $OutFile -NoTypeInformation -Append
+        } else {
+            $hits | Export-Csv -Path $OutFile -NoTypeInformation
+        }
         if (-not $GraphRun) {
             Write-Host -ForegroundColor Yellow "[*] Wrote $($hits.Count) match(es) to $OutFile"
         }
