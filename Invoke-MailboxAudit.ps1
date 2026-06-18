@@ -602,6 +602,46 @@ function Get-MailboxSafeFileName {
 }
 
 
+function Get-MbxMatchInfo {
+    param(
+        [string]$Subject,
+        [string]$Body,
+        [string]$AttachmentNames,
+        [string[]]$Terms,
+        [int]$Window = 100
+    )
+    $locations = [System.Collections.Generic.List[string]]::new()
+    $context   = ""
+    # Body first: richest source and preferred for context snippet
+    $fields = [ordered]@{ Body = $Body; Subject = $Subject; AttachmentNames = $AttachmentNames }
+    foreach ($fieldName in $fields.Keys) {
+        $val = $fields[$fieldName]
+        if (-not $val) { continue }
+        foreach ($t in $Terms) {
+            if (-not $t) { continue }
+            $idx = $val.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase)
+            if ($idx -ge 0) {
+                [void]$locations.Add($fieldName)
+                if (-not $context) {
+                    $start   = [Math]::Max(0, $idx - $Window)
+                    $end     = [Math]::Min($val.Length, $idx + $t.Length + $Window)
+                    $snippet = ($val.Substring($start, $end - $start) -replace '\s+', ' ').Trim()
+                    $pfx     = if ($start -gt 0)           { "..." } else { "" }
+                    $sfx     = if ($end   -lt $val.Length)  { "..." } else { "" }
+                    $context = "${pfx}${snippet}${sfx}"
+                }
+                break
+            }
+        }
+    }
+    return [pscustomobject]@{
+        IsMatch   = $locations.Count -gt 0
+        Locations = if ($locations.Count -gt 0) { $locations -join ", " } else { "" }
+        Context   = $context
+    }
+}
+
+
 function Expand-MbxSearchTerms {
     param([string]$Query)
     # KQL detector queries wrap meaningful keywords in double quotes, e.g.:
@@ -900,6 +940,16 @@ function Get-MailboxMessages {
                     }
 
                     $totalBytes += [long]$msg.size
+
+                    $matchLocations = ""
+                    $matchContext   = ""
+                    if ($isSearch) {
+                        $bodyForContext = if ($msg.body -and $msg.body.content) { Remove-MailboxHtmlTags -Html $msg.body.content } else { $preview }
+                        $mi = Get-MbxMatchInfo -Subject $subject -Body $bodyForContext -AttachmentNames $attachNames -Terms $searchTerms
+                        $matchLocations = $mi.Locations
+                        $matchContext   = $mi.Context
+                    }
+
                     $mbxHits.Add([pscustomobject]@{
                         "Detector Name"   = $DetectorName
                         "Mailbox Type"    = "User"
@@ -914,6 +964,8 @@ function Get-MailboxMessages {
                         "HasAttachments"  = [bool]$msg.hasAttachments
                         "AttachmentNames" = $attachNames
                         "BodyFile"        = $bodyFile
+                        "Match Location"  = $matchLocations
+                        "Match Context"   = $matchContext
                     })
 
                     if (-not $ReportOnly) {
@@ -1033,14 +1085,13 @@ function Get-MailboxMessages {
                             $totalBytes += [long]$bodyContent.Length
                             foreach ($att in @($post.attachments)) { $totalBytes += [long]$att.size }
 
+                            $matchLocations = ""
+                            $matchContext   = ""
                             if ($isSearch) {
-                                $isMatch = $false
-                                foreach ($t in $searchTerms) {
-                                    if (($topic -like "*$t*") -or ($bodyText -like "*$t*") -or ($attachNames -like "*$t*")) {
-                                        $isMatch = $true; break
-                                    }
-                                }
-                                if (-not $isMatch) { continue }
+                                $mi = Get-MbxMatchInfo -Subject $topic -Body $bodyText -AttachmentNames $attachNames -Terms $searchTerms
+                                if (-not $mi.IsMatch) { continue }
+                                $matchLocations = $mi.Locations
+                                $matchContext   = $mi.Context
                             }
 
                             $preview  = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { "(No Preview)" }
@@ -1089,6 +1140,8 @@ function Get-MailboxMessages {
                                 "HasAttachments"  = [bool]$post.hasAttachments
                                 "AttachmentNames" = $attachNames
                                 "BodyFile"        = $bodyFile
+                                "Match Location"  = $matchLocations
+                                "Match Context"   = $matchContext
                             })
 
                             if (-not $ReportOnly) {
@@ -1139,24 +1192,20 @@ function Get-MailboxMessages {
                     $nextUri = if (($PageResults -or $isSearch) -and $response.'@odata.nextLink') { $response.'@odata.nextLink' } else { $null }
                 } while ($nextUri)
 
-                $toOutput = if ($isSearch) {
-                    @($collected | Where-Object {
-                        $conv = $_
-                        $matchFound = $false
-                        foreach ($t in $searchTerms) {
-                            if (($conv.topic -and $conv.topic -like "*$t*") -or ($conv.preview -and $conv.preview -like "*$t*")) {
-                                $matchFound = $true; break
-                            }
-                        }
-                        $matchFound
-                    })
-                } else { @($collected) }
-
-                foreach ($conv in $toOutput) {
+                foreach ($conv in $collected) {
                     $topic   = if ($conv.topic)          { $conv.topic } else { "(No Subject)" }
                     $senders = if ($conv.uniqueSenders -and $conv.uniqueSenders.Count -gt 0) { $conv.uniqueSenders -join ", " } else { "(Unknown)" }
                     $date    = if ($conv.lastDeliveredDateTime) { $conv.lastDeliveredDateTime } else { "" }
                     $preview = if ($conv.preview)        { $conv.preview } else { "(No Preview)" }
+
+                    $matchLocations = ""
+                    $matchContext   = ""
+                    if ($isSearch) {
+                        $mi = Get-MbxMatchInfo -Subject $topic -Body $preview -AttachmentNames "" -Terms $searchTerms
+                        if (-not $mi.IsMatch) { continue }
+                        $matchLocations = $mi.Locations
+                        $matchContext   = $mi.Context
+                    }
 
                     $mbxHits.Add([pscustomobject]@{
                         "Detector Name"   = $DetectorName
@@ -1172,6 +1221,8 @@ function Get-MailboxMessages {
                         "HasAttachments"  = [bool]$conv.hasAttachments
                         "AttachmentNames" = ""
                         "BodyFile"        = ""
+                        "Match Location"  = $matchLocations
+                        "Match Context"   = $matchContext
                     })
 
                     if (-not $ReportOnly) {
@@ -1301,14 +1352,8 @@ function Search-MailboxCache {
                 $bodyText = Remove-MailboxHtmlTags -Html $raw
             }
 
-            $isMatch = $false
-            foreach ($t in $searchTerms) {
-                if (($row.Subject -like "*$t*") -or ($bodyText -like "*$t*") -or ($row.AttachmentNames -like "*$t*")) {
-                    $isMatch = $true; break
-                }
-            }
-
-            if (-not $isMatch) { continue }
+            $mi = Get-MbxMatchInfo -Subject $row.Subject -Body $bodyText -AttachmentNames $row.AttachmentNames -Terms $searchTerms
+            if (-not $mi.IsMatch) { continue }
 
             $preview = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { $row.Preview }
 
@@ -1326,6 +1371,8 @@ function Search-MailboxCache {
                 "HasAttachments"  = $row.HasAttachments
                 "AttachmentNames" = $row.AttachmentNames
                 "BodyFile"        = $row.BodyFile
+                "Match Location"  = $mi.Locations
+                "Match Context"   = $mi.Context
             })
 
             if (-not $ReportOnly) {
@@ -1361,14 +1408,8 @@ function Search-MailboxCache {
             $datePart   = if ($fileBase -match '^(\d{4}-\d{2}-\d{2})_') { $Matches[1] } else { "" }
             $subjPart   = $fileBase -replace '^\d{4}-\d{2}-\d{2}_', ''
 
-            $isMatch = $false
-            foreach ($t in $searchTerms) {
-                if (($subjPart -like "*$t*") -or ($bodyText -like "*$t*")) {
-                    $isMatch = $true; break
-                }
-            }
-
-            if (-not $isMatch) { continue }
+            $mi = Get-MbxMatchInfo -Subject $subjPart -Body $bodyText -AttachmentNames "" -Terms $searchTerms
+            if (-not $mi.IsMatch) { continue }
 
             $preview = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { "" }
 
@@ -1386,6 +1427,8 @@ function Search-MailboxCache {
                 "HasAttachments"  = ""
                 "AttachmentNames" = ""
                 "BodyFile"        = $file.FullName
+                "Match Location"  = $mi.Locations
+                "Match Context"   = $mi.Context
             })
 
             if (-not $ReportOnly) {
