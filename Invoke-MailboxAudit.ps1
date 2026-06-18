@@ -1476,3 +1476,4 @@ function Search-MailboxCache {
         Write-Host -ForegroundColor Yellow "[*] Found $($hits.Count) match(es) for detector: $DetectorName"
     }
 }
+
