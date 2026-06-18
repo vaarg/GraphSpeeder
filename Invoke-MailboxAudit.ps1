@@ -610,18 +610,22 @@ function Get-MbxMatchInfo {
         [string[]]$Terms,
         [int]$Window = 100
     )
-    $locations = [System.Collections.Generic.List[string]]::new()
-    $context   = ""
+    $locations    = [System.Collections.Generic.List[string]]::new()
+    $matchedTerms = [System.Collections.Generic.List[string]]::new()
+    $context      = ""
     # Body first: richest source and preferred for context snippet
     $fields = [ordered]@{ Body = $Body; Subject = $Subject; AttachmentNames = $AttachmentNames }
     foreach ($fieldName in $fields.Keys) {
         $val = $fields[$fieldName]
         if (-not $val) { continue }
+        $fieldMatched = $false
         foreach ($t in $Terms) {
             if (-not $t) { continue }
             $idx = $val.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase)
             if ($idx -ge 0) {
-                [void]$locations.Add($fieldName)
+                $fieldMatched = $true
+                $actual = $val.Substring($idx, $t.Length)
+                if (-not $matchedTerms.Contains($actual)) { [void]$matchedTerms.Add($actual) }
                 if (-not $context) {
                     $start   = [Math]::Max(0, $idx - $Window)
                     $end     = [Math]::Min($val.Length, $idx + $t.Length + $Window)
@@ -630,13 +634,14 @@ function Get-MbxMatchInfo {
                     $sfx     = if ($end   -lt $val.Length)  { "..." } else { "" }
                     $context = "${pfx}${snippet}${sfx}"
                 }
-                break
             }
         }
+        if ($fieldMatched) { [void]$locations.Add($fieldName) }
     }
     return [pscustomobject]@{
         IsMatch   = $locations.Count -gt 0
         Locations = if ($locations.Count -gt 0) { $locations -join ", " } else { "" }
+        Match     = if ($matchedTerms.Count -gt 0) { $matchedTerms -join ", " } else { "" }
         Context   = $context
     }
 }
@@ -942,11 +947,13 @@ function Get-MailboxMessages {
                     $totalBytes += [long]$msg.size
 
                     $matchLocations = ""
+                    $matchMatch     = ""
                     $matchContext   = ""
                     if ($isSearch) {
                         $bodyForContext = if ($msg.body -and $msg.body.content) { Remove-MailboxHtmlTags -Html $msg.body.content } else { $preview }
                         $mi = Get-MbxMatchInfo -Subject $subject -Body $bodyForContext -AttachmentNames $attachNames -Terms $searchTerms
                         $matchLocations = $mi.Locations
+                        $matchMatch     = $mi.Match
                         $matchContext   = $mi.Context
                     }
 
@@ -965,6 +972,7 @@ function Get-MailboxMessages {
                         "AttachmentNames" = $attachNames
                         "BodyFile"        = $bodyFile
                         "Match Location"  = $matchLocations
+                        "Match"           = $matchMatch
                         "Match Context"   = $matchContext
                     })
 
@@ -1086,11 +1094,13 @@ function Get-MailboxMessages {
                             foreach ($att in @($post.attachments)) { $totalBytes += [long]$att.size }
 
                             $matchLocations = ""
+                            $matchMatch     = ""
                             $matchContext   = ""
                             if ($isSearch) {
                                 $mi = Get-MbxMatchInfo -Subject $topic -Body $bodyText -AttachmentNames $attachNames -Terms $searchTerms
                                 if (-not $mi.IsMatch) { continue }
                                 $matchLocations = $mi.Locations
+                                $matchMatch     = $mi.Match
                                 $matchContext   = $mi.Context
                             }
 
@@ -1141,6 +1151,7 @@ function Get-MailboxMessages {
                                 "AttachmentNames" = $attachNames
                                 "BodyFile"        = $bodyFile
                                 "Match Location"  = $matchLocations
+                                "Match"           = $matchMatch
                                 "Match Context"   = $matchContext
                             })
 
@@ -1199,11 +1210,13 @@ function Get-MailboxMessages {
                     $preview = if ($conv.preview)        { $conv.preview } else { "(No Preview)" }
 
                     $matchLocations = ""
+                    $matchMatch     = ""
                     $matchContext   = ""
                     if ($isSearch) {
                         $mi = Get-MbxMatchInfo -Subject $topic -Body $preview -AttachmentNames "" -Terms $searchTerms
                         if (-not $mi.IsMatch) { continue }
                         $matchLocations = $mi.Locations
+                        $matchMatch     = $mi.Match
                         $matchContext   = $mi.Context
                     }
 
@@ -1222,6 +1235,7 @@ function Get-MailboxMessages {
                         "AttachmentNames" = ""
                         "BodyFile"        = ""
                         "Match Location"  = $matchLocations
+                        "Match"           = $matchMatch
                         "Match Context"   = $matchContext
                     })
 
@@ -1372,6 +1386,7 @@ function Search-MailboxCache {
                 "AttachmentNames" = $row.AttachmentNames
                 "BodyFile"        = $row.BodyFile
                 "Match Location"  = $mi.Locations
+                "Match"           = $mi.Match
                 "Match Context"   = $mi.Context
             })
 
@@ -1428,6 +1443,7 @@ function Search-MailboxCache {
                 "AttachmentNames" = ""
                 "BodyFile"        = $file.FullName
                 "Match Location"  = $mi.Locations
+                "Match"           = $mi.Match
                 "Match Context"   = $mi.Context
             })
 
