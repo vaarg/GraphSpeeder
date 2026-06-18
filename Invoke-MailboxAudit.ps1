@@ -602,6 +602,27 @@ function Get-MailboxSafeFileName {
 }
 
 
+function Expand-MbxSearchTerms {
+    param([string]$Query)
+    # KQL detector queries wrap meaningful keywords in double quotes, e.g.:
+    #   (filetype:txt OR ...) AND ("AWS_ACCESS_KEY_ID" OR "AWS_SECRET_ACCESS_KEY")
+    # Extract those quoted phrases -- they are the real search signals for email bodies.
+    $quoted = [regex]::Matches($Query, '"([^"]+)"') |
+              ForEach-Object { $_.Groups[1].Value } |
+              Where-Object   { $_.Trim() -ne '' }
+    if ($quoted.Count -gt 0) { return @($quoted) }
+    # No quoted phrases: strip KQL-specific syntax and return remaining tokens as plain keywords.
+    $clean = $Query -replace '(?i)filetype:[^\s)]+', '' `
+                    -replace '(?i)filename:[^\s)]+',  '' `
+                    -replace '(?i)NEAR\(n=\d+\)',      '' `
+                    -replace '\b(AND|OR|NOT)\b',       '' `
+                    -replace '[()"]',                  '' `
+                    -replace '\s+',                    ' '
+    return @($clean.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries) |
+             Where-Object { $_.Length -ge 3 })
+}
+
+
 function Format-MbxSize {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
@@ -708,6 +729,7 @@ function Get-MailboxMessages {
     }
 
     $isSearch       = -not [string]::IsNullOrWhiteSpace($SearchTerm)
+    $searchTerms    = if ($isSearch) { @(Expand-MbxSearchTerms -Query $SearchTerm) } else { @() }
     $groupMailboxes = @($mailboxes | Where-Object { $_.Type -eq "Group" })
     $needsDeepFetch = $DeepGroupSearch -or ($SaveTo -and $groupMailboxes.Count -gt 0)
 
@@ -786,8 +808,9 @@ function Get-MailboxMessages {
             $expandClause = "&`$expand=attachments(`$select=name,contentType,size)"
 
             if ($isSearch) {
-                $escapedTerm = [uri]::EscapeDataString($SearchTerm)
-                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/messages?`$search=%22$escapedTerm%22&`$top=$MessageCount&`$select=$userSelect$expandClause"
+                $searchValue   = ($searchTerms | ForEach-Object { "`"$_`"" }) -join " OR "
+                $escapedSearch = [uri]::EscapeDataString($searchValue)
+                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/messages?`$search=$escapedSearch&`$top=$MessageCount&`$select=$userSelect$expandClause"
             } else {
                 $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/mailFolders/Inbox/messages?`$top=$MessageCount&`$select=$userSelect$expandClause"
             }
@@ -1011,9 +1034,12 @@ function Get-MailboxMessages {
                             foreach ($att in @($post.attachments)) { $totalBytes += [long]$att.size }
 
                             if ($isSearch) {
-                                $isMatch = ($topic       -like "*$SearchTerm*") -or
-                                           ($bodyText    -like "*$SearchTerm*") -or
-                                           ($attachNames -like "*$SearchTerm*")
+                                $isMatch = $false
+                                foreach ($t in $searchTerms) {
+                                    if (($topic -like "*$t*") -or ($bodyText -like "*$t*") -or ($attachNames -like "*$t*")) {
+                                        $isMatch = $true; break
+                                    }
+                                }
                                 if (-not $isMatch) { continue }
                             }
 
@@ -1115,8 +1141,14 @@ function Get-MailboxMessages {
 
                 $toOutput = if ($isSearch) {
                     @($collected | Where-Object {
-                        ($_.topic   -and $_.topic   -like "*$SearchTerm*") -or
-                        ($_.preview -and $_.preview -like "*$SearchTerm*")
+                        $conv = $_
+                        $matchFound = $false
+                        foreach ($t in $searchTerms) {
+                            if (($conv.topic -and $conv.topic -like "*$t*") -or ($conv.preview -and $conv.preview -like "*$t*")) {
+                                $matchFound = $true; break
+                            }
+                        }
+                        $matchFound
                     })
                 } else { @($collected) }
 
@@ -1249,7 +1281,8 @@ function Search-MailboxCache {
         return
     }
 
-    $hits = [System.Collections.Generic.List[object]]::new()
+    $hits        = [System.Collections.Generic.List[object]]::new()
+    $searchTerms = @(Expand-MbxSearchTerms -Query $SearchTerm)
 
     # -----------------------------------------------------------------------
     # CSV mode
@@ -1268,9 +1301,12 @@ function Search-MailboxCache {
                 $bodyText = Remove-MailboxHtmlTags -Html $raw
             }
 
-            $isMatch = ($row.Subject         -like "*$SearchTerm*") -or
-                       ($bodyText            -like "*$SearchTerm*") -or
-                       ($row.AttachmentNames -like "*$SearchTerm*")
+            $isMatch = $false
+            foreach ($t in $searchTerms) {
+                if (($row.Subject -like "*$t*") -or ($bodyText -like "*$t*") -or ($row.AttachmentNames -like "*$t*")) {
+                    $isMatch = $true; break
+                }
+            }
 
             if (-not $isMatch) { continue }
 
@@ -1325,8 +1361,12 @@ function Search-MailboxCache {
             $datePart   = if ($fileBase -match '^(\d{4}-\d{2}-\d{2})_') { $Matches[1] } else { "" }
             $subjPart   = $fileBase -replace '^\d{4}-\d{2}-\d{2}_', ''
 
-            $isMatch = ($subjPart -like "*$SearchTerm*") -or
-                       ($bodyText -like "*$SearchTerm*")
+            $isMatch = $false
+            foreach ($t in $searchTerms) {
+                if (($subjPart -like "*$t*") -or ($bodyText -like "*$t*")) {
+                    $isMatch = $true; break
+                }
+            }
 
             if (-not $isMatch) { continue }
 
@@ -1372,4 +1412,3 @@ function Search-MailboxCache {
         Write-Host -ForegroundColor Yellow "[*] Found $($hits.Count) match(es) for detector: $DetectorName"
     }
 }
-
