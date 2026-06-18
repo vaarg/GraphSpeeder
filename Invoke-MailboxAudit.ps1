@@ -627,7 +627,12 @@ function Get-MailboxMessages {
         # Input: accessible mailboxes CSV from Test-MailboxAccess
         [string]$InputCsv = "AccessibleMailboxes.csv",
 
-        # Filter to a specific mailbox type
+        # Direct targeting: bypass CSV with explicit mailbox ID(s)
+        [string[]]$MailboxId = @(),
+        [ValidateSet("User", "Group")]
+        [string]$MailboxType = "User",
+
+        # Filter to a specific mailbox type (CSV path only; ignored when -MailboxId is used)
         [ValidateSet("User", "Group", "Both")]
         [string]$Type = "Both",
 
@@ -672,23 +677,34 @@ function Get-MailboxMessages {
         return
     }
 
-    if (-not (Test-Path $InputCsv)) {
-        Write-Host -ForegroundColor Red "[!] Input CSV not found: $InputCsv"
-        Write-Host -ForegroundColor Red "[!] Run Test-MailboxAccess first to generate the accessible mailboxes list."
-        return
-    }
+    if ($MailboxId.Count -gt 0) {
+        $mailboxes = @($MailboxId | ForEach-Object {
+            [pscustomobject]@{
+                Type        = $MailboxType
+                Id          = $_
+                DisplayName = $_
+                MailAddress = $_
+            }
+        })
+    } else {
+        if (-not (Test-Path $InputCsv)) {
+            Write-Host -ForegroundColor Red "[!] Input CSV not found: $InputCsv"
+            Write-Host -ForegroundColor Red "[!] Run Test-MailboxAccess first, or use -MailboxId for direct targeting."
+            return
+        }
 
-    $allRows = @(Import-Csv -Path $InputCsv -ErrorAction Stop | Where-Object { $_.Accessible -eq "True" })
+        $allRows = @(Import-Csv -Path $InputCsv -ErrorAction Stop | Where-Object { $_.Accessible -eq "True" })
 
-    $mailboxes = @(switch ($Type) {
-        "User"  { $allRows | Where-Object { $_.Type -eq "User"  } }
-        "Group" { $allRows | Where-Object { $_.Type -eq "Group" } }
-        "Both"  { $allRows }
-    })
+        $mailboxes = @(switch ($Type) {
+            "User"  { $allRows | Where-Object { $_.Type -eq "User"  } }
+            "Group" { $allRows | Where-Object { $_.Type -eq "Group" } }
+            "Both"  { $allRows }
+        })
 
-    if ($mailboxes.Count -eq 0) {
-        Write-Host -ForegroundColor Red "[!] No accessible mailboxes of type '$Type' found in $InputCsv"
-        return
+        if ($mailboxes.Count -eq 0) {
+            Write-Host -ForegroundColor Red "[!] No accessible mailboxes of type '$Type' found in $InputCsv"
+            return
+        }
     }
 
     $isSearch       = -not [string]::IsNullOrWhiteSpace($SearchTerm)
