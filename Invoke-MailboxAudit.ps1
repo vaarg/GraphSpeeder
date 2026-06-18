@@ -586,6 +586,31 @@ function Test-MailboxAccess {
 }
 
 
+function Remove-MailboxHtmlTags {
+    param([string]$Html)
+    if (-not $Html) { return "" }
+    ($Html -replace '<[^>]+>', ' ' -replace '&nbsp;', ' ' -replace '&amp;', '&' -replace '&lt;', '<' -replace '&gt;', '>' -replace '\s+', ' ').Trim()
+}
+
+
+function Get-MailboxSafeFileName {
+    param([string]$Name, [int]$MaxLength = 80)
+    if (-not $Name) { return "unnamed" }
+    $safe = $Name -replace '[\\/:*?"<>|]', '_' -replace '\s+', ' '
+    if ($safe.Length -gt $MaxLength) { $safe = $safe.Substring(0, $MaxLength) }
+    return $safe.Trim('_').Trim()
+}
+
+
+function Format-MbxSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+
+
 function Get-MailboxMessages {
     <#
     .SYNOPSIS
@@ -609,6 +634,13 @@ function Get-MailboxMessages {
         # Message retrieval
         [int]$MessageCount   = 25,
         [string]$SearchTerm  = "",
+
+        # Deep fetch and save
+        [switch]$DeepGroupSearch,
+        [string]$SaveTo        = "",
+        [switch]$SaveAttachments,
+        [switch]$Force,
+        [int]$ConversationThreshold = 100,
 
         # Output / mode
         [string]$DetectorName = "Custom",
@@ -635,6 +667,11 @@ function Get-MailboxMessages {
         if ($claims -and $claims.appid) { $ClientID = $claims.appid }
     }
 
+    if ($SaveAttachments -and -not $SaveTo) {
+        Write-Host -ForegroundColor Red "[!] -SaveAttachments requires -SaveTo to specify an output folder."
+        return
+    }
+
     if (-not (Test-Path $InputCsv)) {
         Write-Host -ForegroundColor Red "[!] Input CSV not found: $InputCsv"
         Write-Host -ForegroundColor Red "[!] Run Test-MailboxAccess first to generate the accessible mailboxes list."
@@ -654,7 +691,25 @@ function Get-MailboxMessages {
         return
     }
 
-    $isSearch = -not [string]::IsNullOrWhiteSpace($SearchTerm)
+    $isSearch       = -not [string]::IsNullOrWhiteSpace($SearchTerm)
+    $groupMailboxes = @($mailboxes | Where-Object { $_.Type -eq "Group" })
+    $needsDeepFetch = $DeepGroupSearch -or ($SaveTo -and $groupMailboxes.Count -gt 0)
+
+    if ($needsDeepFetch -and $groupMailboxes.Count -gt 0 -and -not $Force) {
+        Write-Host -ForegroundColor Yellow "[!] Deep group fetch drills into threads and posts for each conversation across $($groupMailboxes.Count) group(s)."
+        Write-Host -ForegroundColor Yellow "    This makes up to 3 API calls per conversation thread. For active groups this could"
+        Write-Host -ForegroundColor Yellow "    mean hundreds to thousands of requests. Use -Force to skip this prompt."
+        $confirm = Read-Host "    Proceed? [Y/N]"
+        if ($confirm -notmatch '^[Yy]') {
+            Write-Host -ForegroundColor Red "[!] Aborted."
+            return
+        }
+    }
+
+    if ($SaveTo -and -not (Test-Path $SaveTo)) {
+        New-Item -Path $SaveTo -ItemType Directory | Out-Null
+        Write-Host -ForegroundColor Yellow "[*] Created output folder: $SaveTo"
+    }
 
     if (-not $GraphRun) {
         if ($isSearch) {
@@ -662,8 +717,12 @@ function Get-MailboxMessages {
         } else {
             Write-Host -ForegroundColor Yellow "[*] Reading messages from $($mailboxes.Count) accessible mailbox(es) (top $MessageCount per mailbox)..."
         }
-        if ($isSearch -and ($mailboxes | Where-Object { $_.Type -eq "Group" })) {
-            Write-Host -ForegroundColor Yellow "[*] Group search is client-side (topic + preview only). Use -PageResults to search all conversation pages."
+        if ($groupMailboxes.Count -gt 0) {
+            if ($needsDeepFetch) {
+                Write-Host -ForegroundColor Yellow "[*] Group fetch: drilling into post bodies and attachment names (-DeepGroupSearch)."
+            } elseif ($isSearch -and -not $PageResults) {
+                Write-Host -ForegroundColor Yellow "[*] Group search is client-side (topic + preview only). Use -DeepGroupSearch to search full post bodies and attachment names."
+            }
         }
     }
 
@@ -680,6 +739,8 @@ function Get-MailboxMessages {
     $totalHits     = 0
     $mbxNum        = 0
     $csvHeaders    = $false
+    $totalBytes    = [long]0
+    $autoForceDeep = $false
 
     foreach ($mbx in $mailboxes) {
         $mbxNum++
@@ -704,11 +765,15 @@ function Get-MailboxMessages {
         # User mailbox
         # -------------------------------------------------------------------
         if ($mbx.Type -eq "User") {
+            $userSelect   = "id,subject,from,toRecipients,receivedDateTime,hasAttachments,bodyPreview,size"
+            if ($SaveTo)  { $userSelect += ",body" }
+            $expandClause = "&`$expand=attachments(`$select=name,contentType,size)"
+
             if ($isSearch) {
                 $escapedTerm = [uri]::EscapeDataString($SearchTerm)
-                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/messages?`$search=%22$escapedTerm%22&`$top=$MessageCount&`$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview"
+                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/messages?`$search=%22$escapedTerm%22&`$top=$MessageCount&`$select=$userSelect$expandClause"
             } else {
-                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/mailFolders/Inbox/messages?`$top=$MessageCount&`$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview"
+                $baseUri = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/mailFolders/Inbox/messages?`$top=$MessageCount&`$select=$userSelect$expandClause"
             }
 
             $nextUri = $baseUri
@@ -754,27 +819,67 @@ function Get-MailboxMessages {
                 if ($null -eq $response) { break }
 
                 foreach ($msg in @($response.value)) {
-                    $subject   = if ($msg.subject)              { $msg.subject } else { "(No Subject)" }
-                    $msgSender = if ($msg.from)                 { $msg.from.emailAddress.address } else { "(Unknown)" }
+                    $subject   = if ($msg.subject)          { $msg.subject } else { "(No Subject)" }
+                    $msgSender = if ($msg.from)             { $msg.from.emailAddress.address } else { "(Unknown)" }
                     $receivers = @($msg.toRecipients | ForEach-Object { $_.emailAddress.address }) -join ", "
-                    $date      = if ($msg.receivedDateTime)     { $msg.receivedDateTime } else { "" }
-                    $preview   = if ($msg.bodyPreview)          { $msg.bodyPreview } else { "(No Preview)" }
+                    $date      = if ($msg.receivedDateTime) { $msg.receivedDateTime } else { "" }
+                    $preview   = if ($msg.bodyPreview)      { $msg.bodyPreview } else { "(No Preview)" }
 
+                    $attachNames = ""
+                    if ($msg.attachments -and $msg.attachments.Count -gt 0) {
+                        $attachNames = @($msg.attachments | ForEach-Object { $_.name }) -join ", "
+                    }
+
+                    $bodyFile = ""
+                    if ($SaveTo -and $msg.body -and $msg.body.content) {
+                        $ext         = if ($msg.body.contentType -eq "html") { "html" } else { "txt" }
+                        $safeMailbox = Get-MailboxSafeFileName -Name $mbx.DisplayName
+                        $safeDate    = ($date -replace 'T.*', '')
+                        $safeSubject = Get-MailboxSafeFileName -Name $subject -MaxLength 60
+                        $mbxFolder   = Join-Path $SaveTo "User_$safeMailbox"
+                        if (-not (Test-Path $mbxFolder)) { New-Item -Path $mbxFolder -ItemType Directory | Out-Null }
+                        $bodyFile    = Join-Path $mbxFolder "${safeDate}_${safeSubject}.$ext"
+                        $msg.body.content | Out-File -FilePath $bodyFile -Encoding UTF8
+                    }
+
+                    if ($SaveAttachments -and $msg.hasAttachments -and $msg.id) {
+                        try {
+                            $attUri  = "https://graph.microsoft.com/v1.0/users/$($mbx.Id)/messages/$($msg.id)/attachments"
+                            $attResp = Invoke-RestMethod -Method Get -Uri $attUri -Headers $headers -ErrorAction Stop
+                            $safeMailbox = Get-MailboxSafeFileName -Name $mbx.DisplayName
+                            $attFolder   = Join-Path (Join-Path $SaveTo "User_$safeMailbox") "attachments"
+                            if (-not (Test-Path $attFolder)) { New-Item -Path $attFolder -ItemType Directory | Out-Null }
+                            foreach ($att in @($attResp.value)) {
+                                if ($att.'@odata.type' -eq '#microsoft.graph.fileAttachment' -and $att.contentBytes) {
+                                    $attBytes = [System.Convert]::FromBase64String($att.contentBytes)
+                                    [System.IO.File]::WriteAllBytes((Join-Path $attFolder $att.name), $attBytes)
+                                }
+                            }
+                        } catch {
+                            if (-not $GraphRun) { Write-Host -ForegroundColor DarkYellow "`n[*] Could not retrieve attachments for '$subject'" }
+                        }
+                    }
+
+                    $totalBytes += [long]$msg.size
                     $mbxHits.Add([pscustomobject]@{
-                        "Detector Name"  = $DetectorName
-                        "Mailbox Type"   = "User"
-                        "Mailbox ID"     = $mbx.Id
-                        "Mailbox Display"= $mbx.DisplayName
-                        "Mailbox Address"= $mbx.MailAddress
-                        "Subject"        = $subject
-                        "Sender"         = $msgSender
-                        "Receivers"      = $receivers
-                        "Date"           = $date
-                        "Preview"        = $preview
+                        "Detector Name"   = $DetectorName
+                        "Mailbox Type"    = "User"
+                        "Mailbox ID"      = $mbx.Id
+                        "Mailbox Display" = $mbx.DisplayName
+                        "Mailbox Address" = $mbx.MailAddress
+                        "Subject"         = $subject
+                        "Sender"          = $msgSender
+                        "Receivers"       = $receivers
+                        "Date"            = $date
+                        "Preview"         = $preview
+                        "HasAttachments"  = [bool]$msg.hasAttachments
+                        "AttachmentNames" = $attachNames
+                        "BodyFile"        = $bodyFile
                     })
 
                     if (-not $ReportOnly) {
-                        Write-Host "Subject: $subject | Sender: $msgSender | Receivers: $receivers | Date: $date"
+                        Write-Host "Subject: $subject | Sender: $msgSender | Date: $date"
+                        if ($attachNames) { Write-Host "Attachments: $attachNames" }
                         Write-Host "Preview: $preview"
                         Write-Host ("=" * 80)
                     }
@@ -786,97 +891,246 @@ function Get-MailboxMessages {
         }
 
         # -------------------------------------------------------------------
-        # Group mailbox (conversations)
+        # Group mailbox
         # -------------------------------------------------------------------
         elseif ($mbx.Type -eq "Group") {
-            $nextUri = "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/conversations?`$top=$MessageCount"
-            $collected = [System.Collections.Generic.List[object]]::new()
 
-            do {
-                $attempt  = 0
-                $done     = $false
-                $response = $null
+            if ($needsDeepFetch) {
+                # Deep path: conversations -> threads -> posts
+                # -----------------------------------------------
+                $convUri  = "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/conversations?`$top=50&`$select=id,topic,hasAttachments,lastDeliveredDateTime,uniqueSenders"
+                $allConvs = [System.Collections.Generic.List[object]]::new()
 
-                while (-not $done -and $attempt -lt $maxRetries) {
-                    try {
-                        $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $headers -ErrorAction Stop
-                        $done = $true
-                    } catch {
-                        $sc = $null
-                        try { $sc = [int]$_.Exception.Response.StatusCode       } catch {}
-                        try { if (-not $sc) { $sc = [int]$_.Exception.Response.StatusCode.value__ } } catch {}
-
-                        if ($sc -eq 401 -and $attempt -lt ($maxRetries - 1)) {
-                            Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
-                                -tenantid $tenantid -Resource $Resource -Client $Client `
-                                -ClientID $ClientID -Browser $Browser -Device $Device
-                            if ($global:tokens) {
-                                $accessToken  = $global:tokens.access_token
-                                $refreshToken = $global:tokens.refresh_token
-                                $headers["Authorization"] = "Bearer $accessToken"
-                                $startTime = Get-Date
-                            }
-                            $attempt++
-                        } elseif ($sc -eq 429) {
-                            $retryAfter = 10
-                            try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
-                            if (-not $GraphRun) { Write-Host -ForegroundColor DarkYellow "`n[*] Rate limited (429) -- sleeping ${retryAfter}s..." }
-                            Start-Sleep -Seconds $retryAfter
-                        } else {
-                            if (-not $GraphRun) {
-                                Write-Host -ForegroundColor Red "`n[!] Failed to retrieve conversations from $mbxLabel (HTTP $sc): $($_.Exception.Message -replace 'HTTP \d+ - ','')"
-                            }
+                do {
+                    $attempt = 0; $done = $false; $response = $null
+                    while (-not $done -and $attempt -lt $maxRetries) {
+                        try {
+                            $response = Invoke-RestMethod -Method Get -Uri $convUri -Headers $headers -ErrorAction Stop
                             $done = $true
+                        } catch {
+                            $sc = $null
+                            try { $sc = [int]$_.Exception.Response.StatusCode       } catch {}
+                            try { if (-not $sc) { $sc = [int]$_.Exception.Response.StatusCode.value__ } } catch {}
+                            if ($sc -eq 401 -and $attempt -lt ($maxRetries - 1)) {
+                                Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                                    -tenantid $tenantid -Resource $Resource -Client $Client `
+                                    -ClientID $ClientID -Browser $Browser -Device $Device
+                                if ($global:tokens) { $accessToken = $global:tokens.access_token; $refreshToken = $global:tokens.refresh_token; $headers["Authorization"] = "Bearer $accessToken"; $startTime = Get-Date }
+                                $attempt++
+                            } elseif ($sc -eq 429) {
+                                $ra = 10; try { $ra = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                                if (-not $GraphRun) { Write-Host -ForegroundColor DarkYellow "`n[*] 429 -- sleeping ${ra}s..." }
+                                Start-Sleep -Seconds $ra
+                            } else {
+                                if (-not $GraphRun) { Write-Host -ForegroundColor Red "`n[!] Failed to list conversations for $mbxLabel (HTTP $sc)" }
+                                $done = $true
+                            }
+                        }
+                    }
+                    if ($null -eq $response) { break }
+                    $allConvs.AddRange([object[]]@($response.value))
+                    $convUri = if ($response.'@odata.nextLink') { $response.'@odata.nextLink' } else { $null }
+                } while ($convUri)
+
+                if ($allConvs.Count -gt $ConversationThreshold -and -not $Force -and -not $autoForceDeep) {
+                    Write-Host -ForegroundColor Yellow "`n[!] $mbxLabel has $($allConvs.Count) conversations (threshold: $ConversationThreshold)."
+                    Write-Host -ForegroundColor Yellow "    Deep fetch will drill into threads and posts for each one."
+                    $choice = Read-Host "    Proceed? [Y]es / [N]o / [A]ll (skip this prompt for remaining groups)"
+                    if ($choice -match '^[Nn]') { continue }
+                    if ($choice -match '^[Aa]') { $autoForceDeep = $true }
+                }
+
+                foreach ($conv in $allConvs) {
+                    $topic = if ($conv.topic) { $conv.topic } else { "(No Subject)" }
+
+                    # Get threads for this conversation
+                    $tResp = $null
+                    try {
+                        $tResp = Invoke-RestMethod -Method Get -Uri "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/conversations/$($conv.id)/threads?`$select=id" -Headers $headers -ErrorAction Stop
+                    } catch {
+                        $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+                        if ($sc -eq 429) {
+                            $ra = 10; try { $ra = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                            Start-Sleep -Seconds $ra
+                            try { $tResp = Invoke-RestMethod -Method Get -Uri "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/conversations/$($conv.id)/threads?`$select=id" -Headers $headers -ErrorAction Stop } catch {}
+                        } elseif (-not $GraphRun) { Write-Host -ForegroundColor Red "`n[!] Failed to list threads for '$topic' (HTTP $sc)" }
+                    }
+                    if (-not $tResp) { continue }
+
+                    foreach ($thread in @($tResp.value)) {
+                        # Get posts with full bodies and attachment names
+                        $pNextUri = "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/threads/$($thread.id)/posts?`$select=id,body,from,receivedDateTime,hasAttachments&`$expand=attachments(`$select=name,contentType,size)"
+                        $allPosts = [System.Collections.Generic.List[object]]::new()
+
+                        do {
+                            $pResp = $null
+                            try {
+                                $pResp = Invoke-RestMethod -Method Get -Uri $pNextUri -Headers $headers -ErrorAction Stop
+                            } catch {
+                                $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+                                if ($sc -eq 429) {
+                                    $ra = 10; try { $ra = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                                    Start-Sleep -Seconds $ra
+                                    try { $pResp = Invoke-RestMethod -Method Get -Uri $pNextUri -Headers $headers -ErrorAction Stop } catch {}
+                                } elseif (-not $GraphRun) { Write-Host -ForegroundColor Red "`n[!] Failed to list posts for '$topic' (HTTP $sc)" }
+                            }
+                            if ($pResp) {
+                                $allPosts.AddRange([object[]]@($pResp.value))
+                                $pNextUri = if ($pResp.'@odata.nextLink') { $pResp.'@odata.nextLink' } else { $null }
+                            } else { $pNextUri = $null }
+                        } while ($pNextUri)
+
+                        foreach ($post in $allPosts) {
+                            $bodyContent = if ($post.body -and $post.body.content) { $post.body.content } else { "" }
+                            $bodyText    = Remove-MailboxHtmlTags -Html $bodyContent
+                            $postSender  = if ($post.from) { $post.from.emailAddress.address } else { "(Unknown)" }
+                            $postDate    = if ($post.receivedDateTime) { $post.receivedDateTime } else { "" }
+
+                            $attachNames = ""
+                            if ($post.attachments -and $post.attachments.Count -gt 0) {
+                                $attachNames = @($post.attachments | ForEach-Object { $_.name }) -join ", "
+                            }
+
+                            $totalBytes += [long]$bodyContent.Length
+                            foreach ($att in @($post.attachments)) { $totalBytes += [long]$att.size }
+
+                            if ($isSearch) {
+                                $isMatch = ($topic       -like "*$SearchTerm*") -or
+                                           ($bodyText    -like "*$SearchTerm*") -or
+                                           ($attachNames -like "*$SearchTerm*")
+                                if (-not $isMatch) { continue }
+                            }
+
+                            $preview  = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { "(No Preview)" }
+                            $bodyFile = ""
+
+                            if ($SaveTo -and $bodyContent) {
+                                $ext         = if ($post.body.contentType -eq "html") { "html" } else { "txt" }
+                                $safeMailbox = Get-MailboxSafeFileName -Name $mbx.DisplayName
+                                $safeDate    = ($postDate -replace 'T.*', '')
+                                $safeTopic   = Get-MailboxSafeFileName -Name $topic -MaxLength 60
+                                $mbxFolder   = Join-Path $SaveTo "Group_$safeMailbox"
+                                if (-not (Test-Path $mbxFolder)) { New-Item -Path $mbxFolder -ItemType Directory | Out-Null }
+                                $bodyFile    = Join-Path $mbxFolder "${safeDate}_${safeTopic}.$ext"
+                                $bodyContent | Out-File -FilePath $bodyFile -Encoding UTF8
+                            }
+
+                            if ($SaveAttachments -and $post.hasAttachments) {
+                                try {
+                                    $attUri  = "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/threads/$($thread.id)/posts/$($post.id)/attachments"
+                                    $attResp = Invoke-RestMethod -Method Get -Uri $attUri -Headers $headers -ErrorAction Stop
+                                    $safeMailbox = Get-MailboxSafeFileName -Name $mbx.DisplayName
+                                    $attFolder   = Join-Path (Join-Path $SaveTo "Group_$safeMailbox") "attachments"
+                                    if (-not (Test-Path $attFolder)) { New-Item -Path $attFolder -ItemType Directory | Out-Null }
+                                    foreach ($att in @($attResp.value)) {
+                                        if ($att.'@odata.type' -eq '#microsoft.graph.fileAttachment' -and $att.contentBytes) {
+                                            $attBytes = [System.Convert]::FromBase64String($att.contentBytes)
+                                            [System.IO.File]::WriteAllBytes((Join-Path $attFolder $att.name), $attBytes)
+                                        }
+                                    }
+                                } catch {
+                                    if (-not $GraphRun) { Write-Host -ForegroundColor DarkYellow "`n[*] Could not retrieve attachments for post in '$topic'" }
+                                }
+                            }
+
+                            $mbxHits.Add([pscustomobject]@{
+                                "Detector Name"   = $DetectorName
+                                "Mailbox Type"    = "Group"
+                                "Mailbox ID"      = $mbx.Id
+                                "Mailbox Display" = $mbx.DisplayName
+                                "Mailbox Address" = $mbx.MailAddress
+                                "Subject"         = $topic
+                                "Sender"          = $postSender
+                                "Receivers"       = ""
+                                "Date"            = $postDate
+                                "Preview"         = $preview
+                                "HasAttachments"  = [bool]$post.hasAttachments
+                                "AttachmentNames" = $attachNames
+                                "BodyFile"        = $bodyFile
+                            })
+
+                            if (-not $ReportOnly) {
+                                Write-Host "Subject: $topic | Sender: $postSender | Date: $postDate"
+                                if ($attachNames) { Write-Host "Attachments: $attachNames" }
+                                Write-Host "Preview: $($preview.Substring(0, [Math]::Min(200, $preview.Length)))"
+                                Write-Host ("=" * 80)
+                            }
                         }
                     }
                 }
 
-                if ($null -eq $response) { break }
-                $collected.AddRange([object[]]@($response.value))
-
-                # When searching, page through all conversations regardless of -PageResults
-                # so the client-side filter has the full conversation history to work with.
-                $nextUri = if (($PageResults -or $isSearch) -and $response.'@odata.nextLink') {
-                    $response.'@odata.nextLink'
-                } else { $null }
-
-            } while ($nextUri)
-
-            # Apply client-side search filter for groups
-            $toOutput = if ($isSearch) {
-                @($collected | Where-Object {
-                    ($_.topic   -and $_.topic   -like "*$SearchTerm*") -or
-                    ($_.preview -and $_.preview -like "*$SearchTerm*")
-                })
             } else {
-                @($collected)
-            }
+                # Shallow path: conversations only (topic + preview)
+                # -----------------------------------------------
+                $nextUri   = "https://graph.microsoft.com/v1.0/groups/$($mbx.Id)/conversations?`$top=$MessageCount"
+                $collected = [System.Collections.Generic.List[object]]::new()
 
-            foreach ($conv in $toOutput) {
-                $topic     = if ($conv.topic)          { $conv.topic } else { "(No Subject)" }
-                $senders   = if ($conv.uniqueSenders -and $conv.uniqueSenders.Count -gt 0) {
-                                 $conv.uniqueSenders -join ", "
-                             } else { "(Unknown)" }
-                $date      = if ($conv.lastDeliveredDateTime) { $conv.lastDeliveredDateTime } else { "" }
-                $preview   = if ($conv.preview)        { $conv.preview } else { "(No Preview)" }
+                do {
+                    $attempt = 0; $done = $false; $response = $null
+                    while (-not $done -and $attempt -lt $maxRetries) {
+                        try {
+                            $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $headers -ErrorAction Stop
+                            $done = $true
+                        } catch {
+                            $sc = $null
+                            try { $sc = [int]$_.Exception.Response.StatusCode       } catch {}
+                            try { if (-not $sc) { $sc = [int]$_.Exception.Response.StatusCode.value__ } } catch {}
+                            if ($sc -eq 401 -and $attempt -lt ($maxRetries - 1)) {
+                                Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                                    -tenantid $tenantid -Resource $Resource -Client $Client `
+                                    -ClientID $ClientID -Browser $Browser -Device $Device
+                                if ($global:tokens) { $accessToken = $global:tokens.access_token; $refreshToken = $global:tokens.refresh_token; $headers["Authorization"] = "Bearer $accessToken"; $startTime = Get-Date }
+                                $attempt++
+                            } elseif ($sc -eq 429) {
+                                $retryAfter = 10
+                                try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                                if (-not $GraphRun) { Write-Host -ForegroundColor DarkYellow "`n[*] Rate limited (429) -- sleeping ${retryAfter}s..." }
+                                Start-Sleep -Seconds $retryAfter
+                            } else {
+                                if (-not $GraphRun) { Write-Host -ForegroundColor Red "`n[!] Failed to retrieve conversations from $mbxLabel (HTTP $sc): $($_.Exception.Message -replace 'HTTP \d+ - ','')" }
+                                $done = $true
+                            }
+                        }
+                    }
+                    if ($null -eq $response) { break }
+                    $collected.AddRange([object[]]@($response.value))
+                    $nextUri = if (($PageResults -or $isSearch) -and $response.'@odata.nextLink') { $response.'@odata.nextLink' } else { $null }
+                } while ($nextUri)
 
-                $mbxHits.Add([pscustomobject]@{
-                    "Detector Name"  = $DetectorName
-                    "Mailbox Type"   = "Group"
-                    "Mailbox ID"     = $mbx.Id
-                    "Mailbox Display"= $mbx.DisplayName
-                    "Mailbox Address"= $mbx.MailAddress
-                    "Subject"        = $topic
-                    "Sender"         = $senders
-                    "Receivers"      = ""
-                    "Date"           = $date
-                    "Preview"        = $preview
-                })
+                $toOutput = if ($isSearch) {
+                    @($collected | Where-Object {
+                        ($_.topic   -and $_.topic   -like "*$SearchTerm*") -or
+                        ($_.preview -and $_.preview -like "*$SearchTerm*")
+                    })
+                } else { @($collected) }
 
-                if (-not $ReportOnly) {
-                    Write-Host "Subject: $topic | Sender(s): $senders | Date: $date"
-                    Write-Host "Preview: $preview"
-                    Write-Host ("=" * 80)
+                foreach ($conv in $toOutput) {
+                    $topic   = if ($conv.topic)          { $conv.topic } else { "(No Subject)" }
+                    $senders = if ($conv.uniqueSenders -and $conv.uniqueSenders.Count -gt 0) { $conv.uniqueSenders -join ", " } else { "(Unknown)" }
+                    $date    = if ($conv.lastDeliveredDateTime) { $conv.lastDeliveredDateTime } else { "" }
+                    $preview = if ($conv.preview)        { $conv.preview } else { "(No Preview)" }
+
+                    $mbxHits.Add([pscustomobject]@{
+                        "Detector Name"   = $DetectorName
+                        "Mailbox Type"    = "Group"
+                        "Mailbox ID"      = $mbx.Id
+                        "Mailbox Display" = $mbx.DisplayName
+                        "Mailbox Address" = $mbx.MailAddress
+                        "Subject"         = $topic
+                        "Sender"          = $senders
+                        "Receivers"       = ""
+                        "Date"            = $date
+                        "Preview"         = $preview
+                        "HasAttachments"  = [bool]$conv.hasAttachments
+                        "AttachmentNames" = ""
+                        "BodyFile"        = ""
+                    })
+
+                    if (-not $ReportOnly) {
+                        Write-Host "Subject: $topic | Sender(s): $senders | Date: $date"
+                        Write-Host "Preview: $preview"
+                        Write-Host ("=" * 80)
+                    }
                 }
             }
         }
@@ -898,7 +1152,7 @@ function Get-MailboxMessages {
 
         if (-not $GraphRun) {
             $pct = [int](($mbxNum / $mailboxes.Count) * 100)
-            Write-Host -NoNewline -ForegroundColor Cyan "`r[*] $mbxNum/$($mailboxes.Count) ($pct%) mailboxes processed -- $totalHits item(s) found..."
+            Write-Host -NoNewline -ForegroundColor Cyan "`r[*] $mbxNum/$($mailboxes.Count) ($pct%) -- $totalHits item(s) | $(Format-MbxSize $totalBytes) retrieved..."
             [System.Console]::Out.Flush()
         }
     }
@@ -915,5 +1169,190 @@ function Get-MailboxMessages {
         if (-not $GraphRun) {
             Write-Host -ForegroundColor Yellow "[*] Retrieved $totalHits message(s) from $($mailboxes.Count) mailbox(es)."
         }
+    }
+}
+
+
+function Search-MailboxCache {
+    <#
+    .SYNOPSIS
+        Searches locally saved email bodies from a previous Get-MailboxMessages -SaveTo run.
+    .DESCRIPTION
+        Searches cached email files without making any API calls. Two modes:
+
+        CSV mode (-InputCsv): Uses the CSV written by Get-MailboxMessages -OutFile as an index.
+        Searches Subject, full body content (via BodyFile path), and AttachmentNames. All
+        original metadata (Sender, Receivers, Date, etc.) is preserved in output.
+
+        Folder-walk mode (-CachePath only): Walks the SaveTo folder structure directly. Searches
+        filename-derived subject and body content. Sender/Receivers/AttachmentNames are not
+        available without a CSV index.
+
+        When both are supplied, CSV mode takes precedence.
+    .PARAMETER InputCsv
+        Path to the CSV produced by Get-MailboxMessages -OutFile. Used as the search index.
+    .PARAMETER CachePath
+        Path to the folder produced by Get-MailboxMessages -SaveTo. Used for folder-walk mode
+        when no CSV is available.
+    .PARAMETER SearchTerm
+        String to search for. Checked against Subject, body content, and attachment names.
+    .PARAMETER OutFile
+        Path to write matching results as CSV.
+    .PARAMETER DetectorName
+        Label written to the "Detector Name" column in output. Default: "Custom".
+    .PARAMETER ReportOnly
+        Suppress per-hit console output.
+    .PARAMETER GraphRun
+        Suppress all non-error console output (for use in detector loops).
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$InputCsv     = "",
+        [string]$CachePath    = "",
+        [string]$SearchTerm   = "",
+        [string]$OutFile      = "",
+        [string]$DetectorName = "Custom",
+        [switch]$ReportOnly,
+        [switch]$GraphRun
+    )
+
+    if (-not $InputCsv -and -not $CachePath) {
+        Write-Host -ForegroundColor Red "[!] Provide -InputCsv, -CachePath, or both."
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($SearchTerm)) {
+        Write-Host -ForegroundColor Red "[!] -SearchTerm is required."
+        return
+    }
+    if ($InputCsv -and -not (Test-Path $InputCsv)) {
+        Write-Host -ForegroundColor Red "[!] CSV not found: $InputCsv"
+        return
+    }
+    if ($CachePath -and -not (Test-Path $CachePath)) {
+        Write-Host -ForegroundColor Red "[!] Cache path not found: $CachePath"
+        return
+    }
+
+    $hits = [System.Collections.Generic.List[object]]::new()
+
+    # -----------------------------------------------------------------------
+    # CSV mode
+    # -----------------------------------------------------------------------
+    if ($InputCsv) {
+        $rows = @(Import-Csv -Path $InputCsv -ErrorAction Stop)
+
+        if (-not $GraphRun) {
+            Write-Host -ForegroundColor Yellow "[*] Searching $($rows.Count) cached message(s) for: $SearchTerm"
+        }
+
+        foreach ($row in $rows) {
+            $bodyText = ""
+            if ($row.BodyFile -and (Test-Path $row.BodyFile)) {
+                $raw      = Get-Content -Path $row.BodyFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                $bodyText = Remove-MailboxHtmlTags -Html $raw
+            }
+
+            $isMatch = ($row.Subject         -like "*$SearchTerm*") -or
+                       ($bodyText            -like "*$SearchTerm*") -or
+                       ($row.AttachmentNames -like "*$SearchTerm*")
+
+            if (-not $isMatch) { continue }
+
+            $preview = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { $row.Preview }
+
+            $hits.Add([pscustomobject]@{
+                "Detector Name"   = $DetectorName
+                "Mailbox Type"    = $row.'Mailbox Type'
+                "Mailbox ID"      = $row.'Mailbox ID'
+                "Mailbox Display" = $row.'Mailbox Display'
+                "Mailbox Address" = $row.'Mailbox Address'
+                "Subject"         = $row.Subject
+                "Sender"          = $row.Sender
+                "Receivers"       = $row.Receivers
+                "Date"            = $row.Date
+                "Preview"         = $preview
+                "HasAttachments"  = $row.HasAttachments
+                "AttachmentNames" = $row.AttachmentNames
+                "BodyFile"        = $row.BodyFile
+            })
+
+            if (-not $ReportOnly) {
+                Write-Host "Subject: $($row.Subject) | Sender: $($row.Sender) | Date: $($row.Date)"
+                if ($row.AttachmentNames) { Write-Host "Attachments: $($row.AttachmentNames)" }
+                Write-Host "Preview: $($preview.Substring(0, [Math]::Min(200, $preview.Length)))"
+                Write-Host ("=" * 80)
+            }
+        }
+
+    # -----------------------------------------------------------------------
+    # Folder-walk mode
+    # -----------------------------------------------------------------------
+    } else {
+        $bodyFiles = @(Get-ChildItem -Path $CachePath -Recurse -File -Include "*.html","*.txt" |
+                       Where-Object { $_.DirectoryName -notmatch '[/\\]attachments$' })
+
+        if (-not $GraphRun) {
+            Write-Host -ForegroundColor Yellow "[*] Scanning $($bodyFiles.Count) cached file(s) for: $SearchTerm"
+            Write-Host -ForegroundColor Yellow "[*] (Folder-walk mode -- Sender/Receivers/AttachmentNames not available without -InputCsv)"
+        }
+
+        foreach ($file in $bodyFiles) {
+            $raw      = Get-Content -Path $file.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            $bodyText = Remove-MailboxHtmlTags -Html $raw
+
+            $folderLeaf = Split-Path $file.DirectoryName -Leaf
+            $mbxType    = if ($folderLeaf -match '^User_')  { "User"  }
+                          elseif ($folderLeaf -match '^Group_') { "Group" }
+                          else { "Unknown" }
+            $mbxDisplay = $folderLeaf -replace '^(User_|Group_)', ''
+            $fileBase   = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+            $datePart   = if ($fileBase -match '^(\d{4}-\d{2}-\d{2})_') { $Matches[1] } else { "" }
+            $subjPart   = $fileBase -replace '^\d{4}-\d{2}-\d{2}_', ''
+
+            $isMatch = ($subjPart -like "*$SearchTerm*") -or
+                       ($bodyText -like "*$SearchTerm*")
+
+            if (-not $isMatch) { continue }
+
+            $preview = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { "" }
+
+            $hits.Add([pscustomobject]@{
+                "Detector Name"   = $DetectorName
+                "Mailbox Type"    = $mbxType
+                "Mailbox ID"      = ""
+                "Mailbox Display" = $mbxDisplay
+                "Mailbox Address" = ""
+                "Subject"         = $subjPart
+                "Sender"          = ""
+                "Receivers"       = ""
+                "Date"            = $datePart
+                "Preview"         = $preview
+                "HasAttachments"  = ""
+                "AttachmentNames" = ""
+                "BodyFile"        = $file.FullName
+            })
+
+            if (-not $ReportOnly) {
+                Write-Host "Subject: $subjPart | Mailbox: $mbxDisplay ($mbxType) | Date: $datePart"
+                Write-Host "Preview: $($preview.Substring(0, [Math]::Min(200, $preview.Length)))"
+                Write-Host ("=" * 80)
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Output
+    # -----------------------------------------------------------------------
+    if ($OutFile -and $hits.Count -gt 0) {
+        $hits | Export-Csv -Path $OutFile -NoTypeInformation
+        if (-not $GraphRun) {
+            Write-Host -ForegroundColor Yellow "[*] Wrote $($hits.Count) match(es) to $OutFile"
+        }
+    }
+
+    if (-not $GraphRun) {
+        Write-Host -ForegroundColor Yellow "[*] Found $($hits.Count) match(es) for: $SearchTerm"
+    } elseif ($hits.Count -gt 0) {
+        Write-Host -ForegroundColor Yellow "[*] Found $($hits.Count) match(es) for detector: $DetectorName"
     }
 }
