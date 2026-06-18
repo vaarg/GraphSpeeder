@@ -607,14 +607,15 @@ function Get-MbxMatchInfo {
         [string]$Subject,
         [string]$Body,
         [string]$AttachmentNames,
+        [string]$AttachmentContent = "",
         [string[]]$Terms,
         [int]$Window = 100
     )
     $locations    = [System.Collections.Generic.List[string]]::new()
     $matchedTerms = [System.Collections.Generic.List[string]]::new()
     $context      = ""
-    # Body first: richest source and preferred for context snippet
-    $fields = [ordered]@{ Body = $Body; Subject = $Subject; AttachmentNames = $AttachmentNames }
+    # Priority: Body > Subject > Attachment Content > AttachmentNames
+    $fields = [ordered]@{ Body = $Body; Subject = $Subject; "Attachment Content" = $AttachmentContent; AttachmentNames = $AttachmentNames }
     foreach ($fieldName in $fields.Keys) {
         $val = $fields[$fieldName]
         if (-not $val) { continue }
@@ -1295,12 +1296,13 @@ function Search-MailboxCache {
         Searches cached email files without making any API calls. Two modes:
 
         CSV mode (-InputCsv): Uses the CSV written by Get-MailboxMessages -OutFile as an index.
-        Searches Subject, full body content (via BodyFile path), and AttachmentNames. All
-        original metadata (Sender, Receivers, Date, etc.) is preserved in output.
+        Searches Subject, full body content (via BodyFile path), AttachmentNames, and the
+        contents of downloaded attachment files whose extension is in the plaintext whitelist.
+        All original metadata (Sender, Receivers, Date, etc.) is preserved in output.
 
         Folder-walk mode (-CachePath only): Walks the SaveTo folder structure directly. Searches
-        filename-derived subject and body content. Sender/Receivers/AttachmentNames are not
-        available without a CSV index.
+        filename-derived subject and body content. Also searches plaintext attachment files in
+        attachments/ subfolders. Sender/Receivers are not available without a CSV index.
 
         When both are supplied, CSV mode takes precedence.
     .PARAMETER InputCsv
@@ -1309,7 +1311,8 @@ function Search-MailboxCache {
         Path to the folder produced by Get-MailboxMessages -SaveTo. Used for folder-walk mode
         when no CSV is available.
     .PARAMETER SearchTerm
-        String to search for. Checked against Subject, body content, and attachment names.
+        String to search for. Checked against Subject, body content, attachment names, and
+        plaintext attachment file contents.
     .PARAMETER OutFile
         Path to write matching results as CSV.
     .PARAMETER DetectorName
@@ -1349,6 +1352,12 @@ function Search-MailboxCache {
 
     $hits        = [System.Collections.Generic.List[object]]::new()
     $searchTerms = @(Expand-MbxSearchTerms -Query $SearchTerm)
+    $plaintextExts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    @('txt','json','py','xml','ps1','psd1','psm1','js','mjs','ts','java','php','rb','sh',
+      'bash','zsh','fish','env','config','conf','cfg','ini','yaml','yml','toml','log',
+      'properties','sql','csv','tsv','md','bat','cmd','vbs','go','rs','c','cpp','h','cs',
+      'tf','hcl','rdp','ovpn','pem','key','pub','ppk','asc','crt','cer','reg',
+      'bashrc','bash_profile','profile','exports','functions') | ForEach-Object { [void]$plaintextExts.Add($_) }
 
     # -----------------------------------------------------------------------
     # CSV mode
@@ -1367,7 +1376,26 @@ function Search-MailboxCache {
                 $bodyText = Remove-MailboxHtmlTags -Html $raw
             }
 
-            $mi = Get-MbxMatchInfo -Subject $row.Subject -Body $bodyText -AttachmentNames $row.AttachmentNames -Terms $searchTerms
+            $attContent = ""
+            if ($row.BodyFile -and $row.AttachmentNames) {
+                $mbxFolder = Split-Path $row.BodyFile -Parent
+                $attFolder = Join-Path $mbxFolder "attachments"
+                if (Test-Path $attFolder) {
+                    foreach ($attName in ($row.AttachmentNames -split ',\s*')) {
+                        $attName = $attName.Trim()
+                        if (-not $attName) { continue }
+                        $ext = [System.IO.Path]::GetExtension($attName).TrimStart('.').ToLower()
+                        if (-not $plaintextExts.Contains($ext)) { continue }
+                        $attPath = Join-Path $attFolder $attName
+                        if (Test-Path $attPath) {
+                            $attText = Get-Content -Path $attPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                            if ($attText) { $attContent += "`n" + $attText }
+                        }
+                    }
+                }
+            }
+
+            $mi = Get-MbxMatchInfo -Subject $row.Subject -Body $bodyText -AttachmentNames $row.AttachmentNames -AttachmentContent $attContent -Terms $searchTerms
             if (-not $mi.IsMatch) { continue }
 
             $preview = if ($bodyText) { $bodyText.Substring(0, [Math]::Min(500, $bodyText.Length)) } else { $row.Preview }
@@ -1454,6 +1482,58 @@ function Search-MailboxCache {
                 Write-Host ("=" * 80)
             }
         }
+
+        # Also search plaintext attachment files from attachments/ subfolders
+        $attFiles = @(Get-ChildItem -Path $CachePath -Recurse -File |
+                      Where-Object {
+                          $_.DirectoryName -match '[/\\]attachments$' -and
+                          $plaintextExts.Contains($_.Extension.TrimStart('.').ToLower())
+                      })
+
+        if (-not $GraphRun -and $attFiles.Count -gt 0) {
+            Write-Host -ForegroundColor Yellow "[*] Scanning $($attFiles.Count) plaintext attachment file(s) for: $SearchTerm"
+        }
+
+        foreach ($attFile in $attFiles) {
+            $attText = Get-Content -Path $attFile.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            if (-not $attText) { continue }
+
+            $grandParent = Split-Path (Split-Path $attFile.FullName -Parent) -Leaf
+            $attMbxType  = if ($grandParent -match '^User_')  { "User"  }
+                           elseif ($grandParent -match '^Group_') { "Group" }
+                           else { "Unknown" }
+            $attMbxDisp  = $grandParent -replace '^(User_|Group_)', ''
+
+            $mi = Get-MbxMatchInfo -Subject $attFile.Name -Body "" -AttachmentContent $attText -AttachmentNames "" -Terms $searchTerms
+            if (-not $mi.IsMatch) { continue }
+
+            $preview = ($attText.Substring(0, [Math]::Min(500, $attText.Length)) -replace '\s+', ' ').Trim()
+
+            $hits.Add([pscustomobject]@{
+                "Detector Name"   = $DetectorName
+                "Mailbox Type"    = $attMbxType
+                "Mailbox ID"      = ""
+                "Mailbox Display" = $attMbxDisp
+                "Mailbox Address" = ""
+                "Subject"         = "(Attachment: $($attFile.Name))"
+                "Sender"          = ""
+                "Receivers"       = ""
+                "Date"            = ""
+                "Preview"         = $preview
+                "HasAttachments"  = ""
+                "AttachmentNames" = $attFile.Name
+                "BodyFile"        = $attFile.FullName
+                "Match Location"  = $mi.Locations
+                "Match"           = $mi.Match
+                "Match Context"   = $mi.Context
+            })
+
+            if (-not $ReportOnly) {
+                Write-Host "Attachment: $($attFile.Name) | Mailbox: $attMbxDisp ($attMbxType)"
+                Write-Host "Preview: $($preview.Substring(0, [Math]::Min(200, $preview.Length)))"
+                Write-Host ("=" * 80)
+            }
+        }
     }
 
     # -----------------------------------------------------------------------
@@ -1476,4 +1556,3 @@ function Search-MailboxCache {
         Write-Host -ForegroundColor Yellow "[*] Found $($hits.Count) match(es) for detector: $DetectorName"
     }
 }
-
